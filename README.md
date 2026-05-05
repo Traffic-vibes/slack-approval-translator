@@ -10,7 +10,9 @@ Python Slack bot MVP for preparing Russian-to-English translations in Slack with
 - Click `Softer` to make the current English preview more polite, friendly, and natural.
 - Click `Shorter` to make the current English preview shorter while preserving the meaning.
 - Click `Cancel` to discard it.
-- If `TARGET_USER_ID` is configured, incoming English messages are translated into Russian and sent as private ephemeral messages to that user.
+- Users can run `/tr_on` to opt in to automatic incoming English-to-Russian translations.
+- Automatic translations are sent only as private ephemeral messages to opted-in users.
+- Users can run `/tr_off` to opt out and `/tr_status` to check their current setting.
 
 The bot never posts translations to a channel.
 
@@ -41,11 +43,14 @@ The bot never posts translations to a channel.
 
 ## 2. Add slash commands
 
-In your Slack app settings, go to `Features` -> `Slash Commands` and create this command:
+In your Slack app settings, go to `Features` -> `Slash Commands` and create these commands:
 
 | Command | Short description |
 | --- | --- |
 | `/tr` | Translate Russian to approved English |
+| `/tr_on` | Enable private automatic incoming translations |
+| `/tr_off` | Disable private automatic incoming translations |
+| `/tr_status` | Check automatic translation status |
 
 With Socket Mode enabled, Slack delivers slash commands through the bot's WebSocket connection, so you do not need to run a public web server.
 
@@ -105,12 +110,11 @@ OPENAI_API_KEY=sk-proj-your-real-openai-api-key
 OPENAI_MODEL=gpt-4o-mini
 SLACK_BOT_TOKEN=xoxb-your-real-slack-bot-token
 SLACK_APP_TOKEN=xapp-your-real-slack-app-token
-TARGET_USER_ID=U1234567890
 ```
 
-Set `TARGET_USER_ID` to the Slack user ID that should receive automatic incoming English-to-Russian translations. Leave it empty to disable automatic incoming translation.
-
 Do not commit `.env`. It contains real API keys and tokens.
+
+Automatic translation opt-ins are stored locally in `translator_bot.db`, which is created when the bot starts.
 
 ## 7. Run the bot
 
@@ -130,7 +134,20 @@ In a channel where the app is installed or invited:
 
 Slack will show you a private English preview with `Done`, `Softer`, `Shorter`, and `Cancel` buttons.
 
-When `TARGET_USER_ID` is set, regular English messages in subscribed channels, private channels, DMs, and group DMs are also translated to Russian for that configured user. The bot skips bot messages, slash-command-like messages, and messages that contain Cyrillic text.
+To opt in to private automatic incoming English-to-Russian translations:
+
+```text
+/tr_on
+```
+
+To check or disable automatic translation:
+
+```text
+/tr_status
+/tr_off
+```
+
+When one or more users have opted in, regular English messages in subscribed channels, private channels, DMs, and group DMs are translated to Russian and sent as private ephemeral messages to those users. The bot skips bot messages, slash-command-like messages, short messages, and messages that contain Cyrillic text. If the only opted-in user authored the message, the bot does not send that user an automatic translation of their own message.
 
 ## Glossary
 
