@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import time
 from dataclasses import dataclass
 from threading import Lock
@@ -32,7 +33,7 @@ if missing_env:
     )
 
 OPENAI_MODEL = os.environ["OPENAI_MODEL"]
-TARGET_USER_ID = os.getenv("TARGET_USER_ID", "").strip()
+AUTO_TRANSLATE_DB_PATH = os.getenv("DATABASE_PATH", "translator_bot.db")
 PREVIEW_TTL_SECONDS = 15 * 60
 AUTO_TRANSLATE_CHANNEL_TYPES = {"channel", "group", "im", "mpim"}
 LATIN_RE = re.compile(r"[A-Za-z]")
@@ -119,9 +120,64 @@ class PendingTranslation:
 
 pending_translations: Dict[str, PendingTranslation] = {}
 pending_translations_lock = Lock()
+auto_translate_users_lock = Lock()
 
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
+
+
+def initialize_auto_translate_db() -> None:
+    with auto_translate_users_lock:
+        with sqlite3.connect(AUTO_TRANSLATE_DB_PATH) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auto_translate_users (
+                    user_id TEXT PRIMARY KEY,
+                    enabled_at INTEGER NOT NULL
+                )
+                """
+            )
+
+
+def enable_auto_translate_for_user(user_id: str) -> None:
+    with auto_translate_users_lock:
+        with sqlite3.connect(AUTO_TRANSLATE_DB_PATH) as connection:
+            connection.execute(
+                """
+                INSERT INTO auto_translate_users (user_id, enabled_at)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET enabled_at = excluded.enabled_at
+                """,
+                (user_id, int(time.time())),
+            )
+
+
+def disable_auto_translate_for_user(user_id: str) -> None:
+    with auto_translate_users_lock:
+        with sqlite3.connect(AUTO_TRANSLATE_DB_PATH) as connection:
+            connection.execute(
+                "DELETE FROM auto_translate_users WHERE user_id = ?",
+                (user_id,),
+            )
+
+
+def is_auto_translate_enabled_for_user(user_id: str) -> bool:
+    with auto_translate_users_lock:
+        with sqlite3.connect(AUTO_TRANSLATE_DB_PATH) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM auto_translate_users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+    return row is not None
+
+
+def get_auto_translate_user_ids() -> list[str]:
+    with auto_translate_users_lock:
+        with sqlite3.connect(AUTO_TRANSLATE_DB_PATH) as connection:
+            rows = connection.execute(
+                "SELECT user_id FROM auto_translate_users ORDER BY user_id"
+            ).fetchall()
+    return [row[0] for row in rows]
 
 
 def cleanup_pending_translations() -> None:
@@ -282,9 +338,6 @@ def preview_blocks(translated_text: str, token: str) -> list:
 
 @app.event("message")
 def handle_auto_translate_incoming_message(event, client, context):
-    if not TARGET_USER_ID:
-        return
-
     if event.get("channel_type") not in AUTO_TRANSLATE_CHANNEL_TYPES:
         return
 
@@ -305,25 +358,123 @@ def handle_auto_translate_incoming_message(event, client, context):
     if not channel_id:
         return
 
+    recipient_user_ids = get_auto_translate_user_ids()
+    if not recipient_user_ids:
+        return
+
+    message_user_id = event.get("user")
+    if len(recipient_user_ids) == 1 and recipient_user_ids[0] == message_user_id:
+        return
+
     try:
         translated_text = translate(text, EN_TO_RU_SYSTEM_PROMPT)
     except Exception:
         logger.exception("Failed to auto-translate incoming Slack message")
         return
 
-    ephemeral_message = {
-        "channel": channel_id,
-        "user": TARGET_USER_ID,
-        "text": auto_translation_message(translated_text),
-    }
     thread_ts = auto_translation_thread_ts(event)
-    if thread_ts:
-        ephemeral_message["thread_ts"] = thread_ts
+
+    for user_id in recipient_user_ids:
+        ephemeral_message = {
+            "channel": channel_id,
+            "user": user_id,
+            "text": auto_translation_message(translated_text),
+        }
+        if thread_ts:
+            ephemeral_message["thread_ts"] = thread_ts
+
+        try:
+            client.chat_postEphemeral(**ephemeral_message)
+        except Exception:
+            logger.exception(
+                "Failed to post auto-translation ephemeral message to user %s",
+                user_id,
+            )
+
+
+@app.command("/tr_on")
+def handle_auto_translate_on(ack, body, respond):
+    ack()
+    user_id = body.get("user_id")
+    if not user_id:
+        logger.error("Missing user_id in /tr_on payload")
+        respond(
+            response_type="ephemeral",
+            text="Could not identify your Slack user.",
+        )
+        return
 
     try:
-        client.chat_postEphemeral(**ephemeral_message)
+        enable_auto_translate_for_user(user_id)
     except Exception:
-        logger.exception("Failed to post auto-translation ephemeral message")
+        logger.exception("Failed to enable auto-translation for user %s", user_id)
+        respond(
+            response_type="ephemeral",
+            text="Could not update auto-translation status. Check the bot logs and try again.",
+        )
+        return
+
+    respond(
+        response_type="ephemeral",
+        text="Auto-translation is now enabled for you.",
+    )
+
+
+@app.command("/tr_off")
+def handle_auto_translate_off(ack, body, respond):
+    ack()
+    user_id = body.get("user_id")
+    if not user_id:
+        logger.error("Missing user_id in /tr_off payload")
+        respond(
+            response_type="ephemeral",
+            text="Could not identify your Slack user.",
+        )
+        return
+
+    try:
+        disable_auto_translate_for_user(user_id)
+    except Exception:
+        logger.exception("Failed to disable auto-translation for user %s", user_id)
+        respond(
+            response_type="ephemeral",
+            text="Could not update auto-translation status. Check the bot logs and try again.",
+        )
+        return
+
+    respond(
+        response_type="ephemeral",
+        text="Auto-translation is now disabled for you.",
+    )
+
+
+@app.command("/tr_status")
+def handle_auto_translate_status(ack, body, respond):
+    ack()
+    user_id = body.get("user_id")
+    if not user_id:
+        logger.error("Missing user_id in /tr_status payload")
+        respond(
+            response_type="ephemeral",
+            text="Could not identify your Slack user.",
+        )
+        return
+
+    try:
+        is_enabled = is_auto_translate_enabled_for_user(user_id)
+    except Exception:
+        logger.exception("Failed to read auto-translation status for user %s", user_id)
+        respond(
+            response_type="ephemeral",
+            text="Could not read auto-translation status. Check the bot logs and try again.",
+        )
+        return
+
+    status = "enabled" if is_enabled else "disabled"
+    respond(
+        response_type="ephemeral",
+        text=f"Auto-translation is currently {status} for you.",
+    )
 
 
 @app.command("/tr")
@@ -483,5 +634,6 @@ def handle_cancel_translation(ack, body, respond):
 
 
 if __name__ == "__main__":
+    initialize_auto_translate_db()
     logger.info("Starting slack-approval-translator in Socket Mode")
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
