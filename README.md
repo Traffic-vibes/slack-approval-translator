@@ -1,16 +1,18 @@
 # slack-approval-translator
 
-Python Slack bot MVP for approving Russian-to-English translations before posting them to a Slack channel.
+Python Slack bot MVP for preparing Russian-to-English translations in Slack without posting them to a channel.
 
 ## What it does
 
 - `/tr Russian text` translates Russian into natural business English.
 - The English text is shown only to you as an ephemeral preview.
-- Click `Send` to post the English message to the channel.
+- Click `Done` to close the preview after copying the text you need.
+- Click `Softer` to make the current English preview more polite, friendly, and natural.
+- Click `Shorter` to make the current English preview shorter while preserving the meaning.
 - Click `Cancel` to discard it.
-- `/en2ru English text` returns a Russian translation as an ephemeral message.
+- If `TARGET_USER_ID` is configured, incoming English messages are translated into Russian and sent as private ephemeral messages to that user.
 
-The bot never posts `/tr` output automatically.
+The bot never posts translations to a channel.
 
 ## Requirements
 
@@ -30,27 +32,43 @@ The bot never posts `/tr` output automatically.
 8. Add these bot token scopes:
    - `commands`
    - `chat:write`
+   - `channels:history`
+   - `groups:history`
+   - `im:history`
+   - `mpim:history`
 9. Click `Install to Workspace`.
 10. Copy the `Bot User OAuth Token` that starts with `xoxb-`. This is `SLACK_BOT_TOKEN`.
 
 ## 2. Add slash commands
 
-In your Slack app settings, go to `Features` -> `Slash Commands` and create two commands:
+In your Slack app settings, go to `Features` -> `Slash Commands` and create this command:
 
 | Command | Short description |
 | --- | --- |
 | `/tr` | Translate Russian to approved English |
-| `/en2ru` | Translate English to Russian |
 
 With Socket Mode enabled, Slack delivers slash commands through the bot's WebSocket connection, so you do not need to run a public web server.
 
-## 3. Add interactivity
+## 3. Add event subscriptions
+
+Go to `Features` -> `Event Subscriptions` and turn on events.
+
+Under `Subscribe to bot events`, add:
+
+- `message.channels`
+- `message.groups`
+- `message.im`
+- `message.mpim`
+
+Reinstall the app if Slack asks you to apply new scopes or event subscriptions.
+
+## 4. Add interactivity
 
 Go to `Features` -> `Interactivity & Shortcuts` and turn on interactivity.
 
 With Socket Mode enabled, button clicks are also delivered through the WebSocket connection.
 
-## 4. Set up the project
+## 5. Set up the project
 
 Open a terminal in this folder and run:
 
@@ -76,7 +94,7 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-## 5. Create your local `.env` file
+## 6. Create your local `.env` file
 
 Make a copy of `.env.example` named `.env`.
 
@@ -87,11 +105,14 @@ OPENAI_API_KEY=sk-proj-your-real-openai-api-key
 OPENAI_MODEL=gpt-4o-mini
 SLACK_BOT_TOKEN=xoxb-your-real-slack-bot-token
 SLACK_APP_TOKEN=xapp-your-real-slack-app-token
+TARGET_USER_ID=U1234567890
 ```
+
+Set `TARGET_USER_ID` to the Slack user ID that should receive automatic incoming English-to-Russian translations. Leave it empty to disable automatic incoming translation.
 
 Do not commit `.env`. It contains real API keys and tokens.
 
-## 6. Run the bot
+## 7. Run the bot
 
 ```bash
 python app.py
@@ -99,7 +120,7 @@ python app.py
 
 Keep this terminal open while you use the bot in Slack.
 
-## 7. Try it in Slack
+## 8. Try it in Slack
 
 In a channel where the app is installed or invited:
 
@@ -107,15 +128,9 @@ In a channel where the app is installed or invited:
 /tr <paste Russian text here>
 ```
 
-Slack will show you a private English preview with `Send` and `Cancel` buttons.
+Slack will show you a private English preview with `Done`, `Softer`, `Shorter`, and `Cancel` buttons.
 
-Then try:
-
-```text
-/en2ru We need to improve ROAS for this campaign.
-```
-
-Slack will show you a private Russian translation.
+When `TARGET_USER_ID` is set, regular English messages in subscribed channels, private channels, DMs, and group DMs are also translated to Russian for that configured user. The bot skips bot messages, slash-command-like messages, and messages that contain Cyrillic text.
 
 ## Glossary
 

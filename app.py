@@ -1,10 +1,11 @@
 import logging
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass
 from threading import Lock
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -31,7 +32,11 @@ if missing_env:
     )
 
 OPENAI_MODEL = os.environ["OPENAI_MODEL"]
+TARGET_USER_ID = os.getenv("TARGET_USER_ID", "").strip()
 PREVIEW_TTL_SECONDS = 15 * 60
+AUTO_TRANSLATE_CHANNEL_TYPES = {"channel", "group", "im", "mpim"}
+LATIN_RE = re.compile(r"[A-Za-z]")
+CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
 
 GLOSSARY = {
     "ROAS": "Keep as ROAS.",
@@ -83,11 +88,31 @@ offer, landing, pixel, event, purchase, lead, install, and traffic.
 Return only the translated Russian text.
 """.strip()
 
+SOFTER_EN_SYSTEM_PROMPT = f"""
+You are an English writing assistant for an ad-tech and performance marketing team.
+Rewrite the English Slack message to sound more polite, friendly, and natural for a workplace Slack conversation.
+Preserve the exact meaning, facts, numbers, URLs, Slack mentions, line breaks, and simple formatting.
+Do not add explanations, new commitments, or extra context.
+Follow this ad-tech glossary:
+{glossary_text()}
+Return only the rewritten English text.
+""".strip()
+
+SHORTER_EN_SYSTEM_PROMPT = f"""
+You are an English writing assistant for an ad-tech and performance marketing team.
+Rewrite the English Slack message to be shorter while preserving the meaning.
+Keep the tone professional and natural for a workplace Slack conversation.
+Preserve facts, numbers, URLs, Slack mentions, line breaks, and simple formatting.
+Do not add explanations, new commitments, or extra context.
+Follow this ad-tech glossary:
+{glossary_text()}
+Return only the rewritten English text.
+""".strip()
+
 
 @dataclass
 class PendingTranslation:
     user_id: str
-    channel_id: str
     translated_text: str
     created_at: float
 
@@ -128,6 +153,71 @@ def translate(text: str, system_prompt: str) -> str:
     return translated.strip()
 
 
+def get_pending_for_action(
+    token: str,
+    user_id: Optional[str],
+    action_verb: str,
+) -> Tuple[Optional[PendingTranslation], Optional[str]]:
+    with pending_translations_lock:
+        pending = pending_translations.get(token)
+
+    if not pending:
+        return None, "This preview expired or was already handled."
+
+    if pending.user_id != user_id:
+        return (
+            pending,
+            f"Only the person who created this preview can {action_verb} it.",
+        )
+
+    return pending, None
+
+
+def context_value(context, key: str) -> Optional[str]:
+    if context is None:
+        return None
+
+    value = getattr(context, key, None)
+    if value is not None:
+        return value
+
+    if hasattr(context, "get"):
+        return context.get(key)
+
+    return None
+
+
+def is_message_from_this_app(event: dict, context) -> bool:
+    bot_user_id = context_value(context, "bot_user_id")
+    return bool(bot_user_id and event.get("user") == bot_user_id)
+
+
+def count_words(text: str) -> int:
+    return len(text.strip().split())
+
+
+def should_auto_translate_text(text: str) -> bool:
+    stripped_text = text.strip()
+    if not stripped_text or stripped_text.startswith("/"):
+        return False
+
+    # Prevent noisy translations for short Slack replies.
+    if count_words(stripped_text) <= 5:
+        return False
+
+    has_latin = bool(LATIN_RE.search(stripped_text))
+    has_cyrillic = bool(CYRILLIC_RE.search(stripped_text))
+    return has_latin and not has_cyrillic
+
+
+def auto_translation_message(translated_text: str) -> str:
+    return f"Translation\n\n{translated_text}"
+
+
+def auto_translation_thread_ts(event: dict) -> Optional[str]:
+    return event.get("thread_ts") or event.get("ts")
+
+
 def slack_escape(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -140,6 +230,10 @@ def truncate_for_slack_block(text: str, limit: int = 2800) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 32].rstrip() + "\n\n[Preview truncated]"
+
+
+def draft_preview_text(translated_text: str) -> str:
+    return f"English preview:\n{translated_text}"
 
 
 def preview_blocks(translated_text: str, token: str) -> list:
@@ -157,9 +251,21 @@ def preview_blocks(translated_text: str, token: str) -> list:
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Send"},
+                    "text": {"type": "plain_text", "text": "Done"},
                     "style": "primary",
-                    "action_id": "tr_send",
+                    "action_id": "tr_done",
+                    "value": token,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Softer"},
+                    "action_id": "tr_softer",
+                    "value": token,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Shorter"},
+                    "action_id": "tr_shorter",
                     "value": token,
                 },
                 {
@@ -172,6 +278,52 @@ def preview_blocks(translated_text: str, token: str) -> list:
             ],
         },
     ]
+
+
+@app.event("message")
+def handle_auto_translate_incoming_message(event, client, context):
+    if not TARGET_USER_ID:
+        return
+
+    if event.get("channel_type") not in AUTO_TRANSLATE_CHANNEL_TYPES:
+        return
+
+    if event.get("subtype") is not None:
+        return
+
+    if event.get("bot_id") or event.get("bot_profile"):
+        return
+
+    if is_message_from_this_app(event, context):
+        return
+
+    text = (event.get("text") or "").strip()
+    if not should_auto_translate_text(text):
+        return
+
+    channel_id = event.get("channel")
+    if not channel_id:
+        return
+
+    try:
+        translated_text = translate(text, EN_TO_RU_SYSTEM_PROMPT)
+    except Exception:
+        logger.exception("Failed to auto-translate incoming Slack message")
+        return
+
+    ephemeral_message = {
+        "channel": channel_id,
+        "user": TARGET_USER_ID,
+        "text": auto_translation_message(translated_text),
+    }
+    thread_ts = auto_translation_thread_ts(event)
+    if thread_ts:
+        ephemeral_message["thread_ts"] = thread_ts
+
+    try:
+        client.chat_postEphemeral(**ephemeral_message)
+    except Exception:
+        logger.exception("Failed to post auto-translation ephemeral message")
 
 
 @app.command("/tr")
@@ -201,44 +353,19 @@ def handle_translate_to_english(ack, body, respond):
     with pending_translations_lock:
         pending_translations[token] = PendingTranslation(
             user_id=body["user_id"],
-            channel_id=body["channel_id"],
             translated_text=translated_text,
             created_at=time.time(),
         )
 
     respond(
         response_type="ephemeral",
-        text=f"English preview:\n{translated_text}",
+        text=draft_preview_text(translated_text),
         blocks=preview_blocks(translated_text, token),
     )
 
 
-@app.command("/en2ru")
-def handle_translate_to_russian(ack, body, respond):
-    ack()
-    text = (body.get("text") or "").strip()
-    if not text:
-        respond(
-            response_type="ephemeral",
-            text="Usage: /en2ru English text to translate",
-        )
-        return
-
-    try:
-        translated_text = translate(text, EN_TO_RU_SYSTEM_PROMPT)
-    except Exception:
-        logger.exception("Failed to translate /en2ru input")
-        respond(
-            response_type="ephemeral",
-            text="Translation failed. Check the bot logs and try again.",
-        )
-        return
-
-    respond(response_type="ephemeral", text=translated_text)
-
-
-@app.action("tr_send")
-def handle_send_translation(ack, body, client, respond):
+@app.action("tr_done")
+def handle_done_translation(ack, body, respond):
     ack()
     cleanup_pending_translations()
 
@@ -251,39 +378,81 @@ def handle_send_translation(ack, body, client, respond):
             pending_translations.pop(token, None)
 
     if not pending:
-        respond(
-            response_type="ephemeral",
-            replace_original=True,
-            text="This preview expired or was already handled.",
-        )
         return
 
     if pending.user_id != user_id:
+        return
+
+    respond(
+        replace_original=True,
+        text="\u200b",
+        blocks=[],
+    )
+
+
+def handle_rewrite_translation(ack, body, respond, system_prompt: str, action_name: str):
+    ack()
+    cleanup_pending_translations()
+
+    token = body["actions"][0]["value"]
+    user_id = body.get("user", {}).get("id")
+
+    pending, error = get_pending_for_action(token, user_id, "rewrite")
+    if error:
+        if not pending:
+            return
+
         respond(
             response_type="ephemeral",
-            text="Only the person who created this preview can send it.",
+            text=error,
         )
         return
 
+    current_text = pending.translated_text
+
     try:
-        client.chat_postMessage(
-            channel=pending.channel_id,
-            text=pending.translated_text,
-        )
+        rewritten_text = translate(current_text, system_prompt)
     except Exception:
-        with pending_translations_lock:
-            pending_translations[token] = pending
-        logger.exception("Failed to post translated message")
-        respond(
-            response_type="ephemeral",
-            text="Could not post the message. Check the bot logs and try again.",
-        )
+        logger.exception("Failed to %s translation preview", action_name)
+        return
+
+    with pending_translations_lock:
+        latest_pending = pending_translations.get(token)
+        if latest_pending and latest_pending.user_id == user_id:
+            latest_pending.translated_text = rewritten_text
+        else:
+            latest_pending = None
+
+    if not latest_pending:
         return
 
     respond(
         response_type="ephemeral",
         replace_original=True,
-        text="Sent.",
+        text=draft_preview_text(rewritten_text),
+        blocks=preview_blocks(rewritten_text, token),
+    )
+
+
+@app.action("tr_softer")
+def handle_softer_translation(ack, body, respond):
+    handle_rewrite_translation(
+        ack=ack,
+        body=body,
+        respond=respond,
+        system_prompt=SOFTER_EN_SYSTEM_PROMPT,
+        action_name="soften",
+    )
+
+
+@app.action("tr_shorter")
+def handle_shorter_translation(ack, body, respond):
+    handle_rewrite_translation(
+        ack=ack,
+        body=body,
+        respond=respond,
+        system_prompt=SHORTER_EN_SYSTEM_PROMPT,
+        action_name="shorten",
     )
 
 
@@ -300,17 +469,16 @@ def handle_cancel_translation(ack, body, respond):
         if pending and pending.user_id == user_id:
             pending_translations.pop(token, None)
 
-    if pending and pending.user_id != user_id:
-        respond(
-            response_type="ephemeral",
-            text="Only the person who created this preview can cancel it.",
-        )
+    if not pending:
+        return
+
+    if pending.user_id != user_id:
         return
 
     respond(
-        response_type="ephemeral",
         replace_original=True,
-        text="Canceled.",
+        text="\u200b",
+        blocks=[],
     )
 
 
