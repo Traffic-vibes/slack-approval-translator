@@ -252,18 +252,62 @@ def count_words(text: str) -> int:
     return len(text.strip().split())
 
 
-def should_auto_translate_text(text: str) -> bool:
+def log_auto_translate_message_event(event: dict) -> None:
+    text = event.get("text") or ""
+    logger.debug(
+        "incoming message event: channel=%r channel_type=%r user=%r bot_id=%r "
+        "subtype=%r text=%r ts=%r thread_ts=%r word_count=%d",
+        event.get("channel"),
+        event.get("channel_type"),
+        event.get("user"),
+        event.get("bot_id"),
+        event.get("subtype"),
+        text,
+        event.get("ts"),
+        event.get("thread_ts"),
+        count_words(text),
+    )
+
+
+def log_auto_translate_skip(reason: str, event: dict) -> None:
+    text = event.get("text") or ""
+    logger.debug(
+        "skipped: %s channel=%r channel_type=%r user=%r bot_id=%r subtype=%r "
+        "ts=%r thread_ts=%r word_count=%d",
+        reason,
+        event.get("channel"),
+        event.get("channel_type"),
+        event.get("user"),
+        event.get("bot_id"),
+        event.get("subtype"),
+        event.get("ts"),
+        event.get("thread_ts"),
+        count_words(text),
+    )
+
+
+def auto_translate_text_skip_reason(text: str) -> Optional[str]:
     stripped_text = text.strip()
-    if not stripped_text or stripped_text.startswith("/"):
-        return False
+    if not stripped_text:
+        return "empty text"
+
+    if stripped_text.startswith("/"):
+        return "slash command"
 
     # Prevent noisy translations for short Slack replies.
     if count_words(stripped_text) <= 5:
-        return False
+        return "too short"
 
     has_latin = bool(LATIN_RE.search(stripped_text))
     has_cyrillic = bool(CYRILLIC_RE.search(stripped_text))
-    return has_latin and not has_cyrillic
+    if not (has_latin and not has_cyrillic):
+        return "not english"
+
+    return None
+
+
+def should_auto_translate_text(text: str) -> bool:
+    return auto_translate_text_skip_reason(text) is None
 
 
 def auto_translation_message(translated_text: str) -> str:
@@ -338,38 +382,54 @@ def preview_blocks(translated_text: str, token: str) -> list:
 
 @app.event("message")
 def handle_auto_translate_incoming_message(event, client, context):
+    log_auto_translate_message_event(event)
+
     if event.get("channel_type") not in AUTO_TRANSLATE_CHANNEL_TYPES:
+        log_auto_translate_skip("unsupported channel_type", event)
+        return
+
+    if (
+        event.get("bot_id")
+        or event.get("bot_profile")
+        or event.get("subtype") == "bot_message"
+    ):
+        log_auto_translate_skip("bot message", event)
         return
 
     if event.get("subtype") is not None:
-        return
-
-    if event.get("bot_id") or event.get("bot_profile"):
+        log_auto_translate_skip("subtype", event)
         return
 
     if is_message_from_this_app(event, context):
+        log_auto_translate_skip("own message", event)
         return
 
     text = (event.get("text") or "").strip()
-    if not should_auto_translate_text(text):
+    text_skip_reason = auto_translate_text_skip_reason(text)
+    if text_skip_reason:
+        log_auto_translate_skip(text_skip_reason, event)
         return
 
     channel_id = event.get("channel")
     if not channel_id:
+        log_auto_translate_skip("missing channel", event)
         return
 
     recipient_user_ids = get_auto_translate_user_ids()
     if not recipient_user_ids:
+        log_auto_translate_skip("no opted-in users", event)
         return
 
     message_user_id = event.get("user")
     if len(recipient_user_ids) == 1 and recipient_user_ids[0] == message_user_id:
+        log_auto_translate_skip("own message", event)
         return
 
     try:
         translated_text = translate(text, EN_TO_RU_SYSTEM_PROMPT)
     except Exception:
         logger.exception("Failed to auto-translate incoming Slack message")
+        log_auto_translate_skip("translation failed", event)
         return
 
     thread_ts = auto_translation_thread_ts(event)
@@ -385,6 +445,12 @@ def handle_auto_translate_incoming_message(event, client, context):
 
         try:
             client.chat_postEphemeral(**ephemeral_message)
+            logger.debug(
+                "auto-translation sent: target_user_id=%r channel=%r thread_ts=%r",
+                user_id,
+                channel_id,
+                thread_ts,
+            )
         except Exception:
             logger.exception(
                 "Failed to post auto-translation ephemeral message to user %s",
