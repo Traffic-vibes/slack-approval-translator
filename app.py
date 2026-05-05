@@ -702,4 +702,10 @@ def handle_cancel_translation(ack, body, respond):
 if __name__ == "__main__":
     initialize_auto_translate_db()
     logger.info("Starting slack-approval-translator in Socket Mode")
-    SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+    handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
+    handler.start()
+
+    # Railway runs this as a long-lived worker; keep the process alive after
+    # Socket Mode starts so the container is not treated as finished.
+    while True:
+        time.sleep(60)
